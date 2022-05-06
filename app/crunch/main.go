@@ -1,8 +1,12 @@
 package main
 
 import (
+	"encoding/json"
 	"log"
 	"math/big"
+
+	"github.com/shirou/gopsutil/v3/cpu"
+	"github.com/shirou/gopsutil/v3/host"
 )
 
 var (
@@ -11,7 +15,34 @@ var (
 	three = big.NewInt(3)
 )
 
+func cpuinfo() {
+	cpus, err := cpu.Info()
+	if err != nil {
+		log.Fatal(err)
+	}
+	j, err := json.Marshal(cpus)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("CPU Info: %s", string(j))
+}
+
+func showHostname() {
+	info, err := host.Info()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	j, err := json.Marshal(info)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("Host Info: %s", string(j))
+}
+
 func main() {
+	cpuinfo()
+	showHostname()
 	starting := big.NewInt(0)
 	starting.SetBit(starting, 67, 1)
 	starting.SetBit(starting, 0, 1) // make odd
@@ -28,8 +59,8 @@ func main() {
 
 }
 
-func iterate(s *big.Int) {
-	n := big.NewInt(0)
+func iterate(s *big.Int) (iterCount int, n *big.Int) {
+	n = big.NewInt(0)
 	n.Add(n, s)
 	for {
 		if n.Bit(0) == 0 {
