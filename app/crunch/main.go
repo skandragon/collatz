@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"math/big"
+	"os"
 	"time"
 
 	"github.com/shirou/gopsutil/v3/cpu"
@@ -31,6 +32,12 @@ type WorkPacket struct {
 	// Nonce is used as a work authenticator.
 	Nonce string `json:"nonce,omitempty"`
 
+	// StartingValue is the first number (inclusive) to check.
+	StartingValue *big.Int `json:"startingValue,omitempty"`
+
+	// EndingValue is the last number (inclusive) to check.
+	EndingValue *big.Int `json:"endingValue,omitempty"`
+
 	// AssignedOn is when this work item was assigned.
 	AssignedOn time.Time `json:"assignedOn,omitempty"`
 
@@ -40,12 +47,6 @@ type WorkPacket struct {
 	// completed after this time, if the evidence is accepted,
 	// work will still be considered complete.
 	Expiry time.Time `json:"expiry,omitempty"`
-
-	// StartingValue is the first number (inclusive) to check.
-	StartingValue *big.Int `json:"startingValue,omitempty"`
-
-	// EndingValue is the last number (inclusive) to check.
-	EndingValue *big.Int `json:"endingValue,omitempty"`
 }
 
 // WorkProgressReport is a message sent to indicate
@@ -125,7 +126,7 @@ func main() {
 	log.Printf("Node Info: %#v", ni)
 
 	starting := big.NewInt(0)
-	starting.SetBit(starting, 67, 1)
+	starting.SetBit(starting, 10341, 1)
 	starting.SetBit(starting, 0, 1) // make odd
 	counter := 1
 	for {
@@ -134,16 +135,19 @@ func main() {
 			log.Printf("bitlen %d testing %s", starting.BitLen(), starting)
 			counter = 1
 		}
-		iterate(starting)
+		interesting, _ := iterate(starting)
+		if interesting {
+			log.Printf("Found something interesting: %s", starting)
+			os.Exit(0)
+		}
 		starting.Add(starting, two)
 	}
 
 }
 
-func iterate(s *big.Int) int {
+func iterate(s *big.Int) (interesting bool, iterCount int) {
 	n := big.NewInt(0)
 	n.Add(n, s)
-	iterCount := 0
 	for {
 		iterCount++
 		if n.Bit(0) == 0 {
@@ -155,8 +159,9 @@ func iterate(s *big.Int) int {
 		c := n.Cmp(s)
 		if c == 0 {
 			log.Printf("Found a loop back to starting value: %s", n)
+			return true, iterCount
 		} else if c == -1 {
-			return iterCount
+			return false, iterCount
 		}
 	}
 }
