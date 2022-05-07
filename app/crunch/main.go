@@ -1,19 +1,25 @@
 package main
 
 import (
+	"encoding/base64"
+	"fmt"
 	"log"
 	"math/big"
-	"os"
 	"time"
 
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/host"
+	"github.com/zeebo/blake3"
 )
 
 var (
 	one   = big.NewInt(1)
 	two   = big.NewInt(2)
 	three = big.NewInt(3)
+)
+
+const (
+	blocksize = 100000000
 )
 
 // NodeInfo holds some somewhat arbitrary info about a worker node.
@@ -49,21 +55,30 @@ type WorkPacket struct {
 	Expiry time.Time `json:"expiry,omitempty"`
 }
 
+type UserCredentials struct {
+	UserID            string `json:"userId,omitempty"`
+	UserSecret        string `json:"userSecret,omitempty"`
+	UserSecretVersion string `json:"user_secret_version,omitempty"`
+}
+
+type WorkAuthenticator struct {
+	UserSecretVersion    string `json:"userSecretVersion,omitempty"`
+	AuthenticatorVersion string `json:"authenticatorVersion,omitempty"`
+	Authenticator        string `json:"authenticator,omitempty"`
+}
+
+// WorkEvidence is used for proving work was performed.  For non-"complete" status updates,
+// these should be set to zero.
+type WorkEvidence struct {
+	TotalIterations uint64 `json:"totalIterations,omitempty"`
+	MaxIterations   uint64 `json:"maxIterations,omitempty"`
+}
+
 // WorkProgressReport is a message sent to indicate
 // completed work, as well as status updates as work is
 // performed, and other status changes.
 type WorkProgressReport struct {
-	// ID is the work packet ID, assigned by the server.
-	ID string `json:"id,omitempty"`
-
-	// Nonce is used as a work authenticator.
-	Nonce string `json:"nonce,omitempty"`
-
-	// StartingValue is the first number (inclusive) to check.
-	StartingValue *big.Int `json:"startingValue,omitempty"`
-
-	// EndingValue is the last number (inclusive) to check.
-	EndingValue *big.Int `json:"endingValue,omitempty"`
+	Work WorkPacket
 
 	// NodeInfo is the collected node info for where this work
 	// was performed.
@@ -73,35 +88,48 @@ type WorkProgressReport struct {
 	// work unit.
 	WorkerID int `json:"workerID,omitempty"`
 
-	// Evidence is a base64(sha512("Work.ID:Work.Nonce:StartingValue:EndingValue:$iterHash"))
-	// where $iterHash is a hash of the string representation of each iteration count, with a single \n
-	// between them.
-	// If the work is still in progress, this should be empty.
-	Evidence string `json:"evidence,omitempty"`
-
-	// Authenticator is a signed Evidence hash, which is
-	//   auth = sha512(UserID:UserSecret:UserSecretVersion:Evidence)
-	// base64(sha512(SecretVersion + ":" + base64(auth)))
-	// If the work is still in progress, the hash is of an evidence
-	// hash where $iterString is set to "in-progress"
-	Authenticator string
-
 	// Status indicates why we are sending this report.
-	//   PENDING = in our work list, but not yet started.
-	//   RUNNING = currently running on a worker.
-	//   ABANDONED = we no longer wish to work on this.
-	//   COMPLETED = we have completed the work requested.
-	// While statuses other than "COMPLETED" can be sent and will
+	//   pending = in our work list, but not yet started.
+	//   running = currently running on a worker.
+	//   abandoned = we no longer wish to work on this.
+	//   completed = we have completed the work requested.
+	// While statuses other than "completed" can be sent and will
 	// update the user's view of work they have in progress,
-	// only "COMPLETED" is required to be sent.  Work without
-	// any other update will be marked as "PENDING" in the UI.
-	Status string
+	// only "completed" is required to be sent.  Work without
+	// any other update will be marked as "pending" in the UI.
+	Status string `json:"status,omitempty"`
 
 	// StartedOn is the UTC timestamp of when we began working on this specific work packet.
 	StartedOn time.Time `json:"startedOn,omitempty"`
 
 	// CompletedOn is when we completed the work.
 	CompletedOn time.Time `json:"completedOn,omitempty"`
+
+	Evidence WorkEvidence `json:"evidence,omitempty"`
+}
+
+var (
+	work = &WorkPacket{
+		ID:         "id-of-packet",
+		Nonce:      "nonce-of-packet",
+		AssignedOn: time.Now().UTC(),
+	}
+)
+
+// envidenceHash returns a base64 encoded hash for the evidence provided.
+func evidenceHash(user UserCredentials, work WorkPacket, evidence WorkEvidence) WorkAuthenticator {
+	h := blake3.New()
+	s := fmt.Sprintf("%s:%s:%s:%s:%d:%d",
+		work.ID, work.Nonce, work.StartingValue, work.EndingValue,
+		evidence.TotalIterations, evidence.MaxIterations)
+	h.Write([]byte(s))
+	sum := h.Sum(nil)
+	authenticator := base64.StdEncoding.EncodeToString(sum)
+	return WorkAuthenticator{
+		UserSecretVersion:    user.UserSecretVersion,
+		AuthenticatorVersion: "v1-blake3",
+		Authenticator:        authenticator,
+	}
 }
 
 func cpuinfo() (*NodeInfo, error) {
@@ -126,26 +154,78 @@ func main() {
 	log.Printf("Node Info: %#v", ni)
 
 	starting := big.NewInt(0)
-	starting.SetBit(starting, 10341, 1)
+	starting.SetBit(starting, 67, 1)
 	starting.SetBit(starting, 0, 1) // make odd
-	counter := 1
+
+	ending := big.NewInt(0)
+	ending.Add(ending, starting)
+	count := big.NewInt(blocksize)
+	ending.Add(ending, count)
+
+	work.StartingValue = starting
+	work.EndingValue = ending
+	totalInterations, max, found := run(work)
+	log.Printf("totalIterations: %d", totalInterations)
+	log.Printf("found: %v", found)
+	log.Printf("Average iterations per test: %.6f", float64(totalInterations)/float64(blocksize))
+	log.Printf("  max %d", max)
+}
+
+func run(work *WorkPacket) (uint64, uint64, []*big.Int) {
+	startTime := time.Now().UTC().UnixMilli()
+	counter := 0
+	current := big.NewInt(0)
+	current.Add(current, work.StartingValue)
+	interetingNumbers := []*big.Int{}
+	totalIterations := uint64(0)
+	maxIterations := uint64(0)
 	for {
 		counter++
 		if counter == 10000000 {
-			log.Printf("bitlen %d testing %s", starting.BitLen(), starting)
-			counter = 1
-		}
-		interesting, _ := iterate(starting)
-		if interesting {
-			log.Printf("Found something interesting: %s", starting)
-			os.Exit(0)
-		}
-		starting.Add(starting, two)
-	}
+			now := time.Now().UTC().UnixMilli()
+			rate := calcRate(work.StartingValue, current, startTime, now)
 
+			log.Printf("bitlen %d testing %s, totalIterations %d, rate %.5f",
+				current.BitLen(), current, totalIterations, rate)
+			counter = 0
+		}
+		interesting, iterCount := iterate(current)
+		totalIterations += iterCount
+		if maxIterations < iterCount {
+			maxIterations = iterCount
+		}
+		if interesting {
+			v := big.NewInt(0)
+			v.Add(v, current)
+			interetingNumbers = append(interetingNumbers, v)
+		}
+		shouldEnd := current.Cmp(work.EndingValue)
+		if shouldEnd > 0 {
+			break
+		}
+		current.Add(current, two)
+	}
+	endTime := time.Now().UTC().UnixMilli()
+	rate := calcRate(work.StartingValue, work.EndingValue, startTime, endTime)
+
+	log.Printf("Block completed.")
+	log.Printf("   Starting: %s", work.StartingValue)
+	log.Printf("     Ending: %s", work.EndingValue)
+	log.Printf("       last: %s", current)
+	log.Printf("       Rate: %.5f", rate)
+	log.Printf("Interesting: %v", interetingNumbers)
+	return totalIterations, maxIterations, interetingNumbers
 }
 
-func iterate(s *big.Int) (interesting bool, iterCount int) {
+func calcRate(s *big.Int, c *big.Int, startTime int64, endTime int64) float64 {
+	duration := float64(endTime-startTime) / 1000.0
+	computed := big.NewInt(0)
+	computed.Sub(c, s)
+	computedi := computed.Int64()
+	return float64(computedi) / duration
+}
+
+func iterate(s *big.Int) (interesting bool, iterCount uint64) {
 	n := big.NewInt(0)
 	n.Add(n, s)
 	for {
