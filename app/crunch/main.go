@@ -33,11 +33,11 @@ var (
 	one       = big.NewInt(1)
 	two       = big.NewInt(2)
 	three     = big.NewInt(3)
-	blocksize = big.NewInt(blocksize_int)
+	blocksize = big.NewInt(blocksizeInt)
 )
 
 const (
-	blocksize_int = 100000000
+	blocksizeInt = 100000000
 )
 
 // NodeInfo holds some somewhat arbitrary info about a worker node.
@@ -201,7 +201,7 @@ func main() {
 			log.Printf("%04d: totalIterations: %d", workerID, totalInterations)
 			log.Printf("%04d: found: %v", workerID, found)
 			log.Printf("%04d: Average iterations per test: %.6f",
-				workerID, float64(totalInterations)/float64(blocksize_int))
+				workerID, float64(totalInterations)/float64(blocksizeInt))
 			log.Printf("%04d:   max %d", workerID, max)
 		}(workerID)
 	}
