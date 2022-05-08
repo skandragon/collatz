@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	"sync"
 	"time"
 
 	"github.com/shirou/gopsutil/v3/cpu"
@@ -13,13 +14,14 @@ import (
 )
 
 var (
-	one   = big.NewInt(1)
-	two   = big.NewInt(2)
-	three = big.NewInt(3)
+	one       = big.NewInt(1)
+	two       = big.NewInt(2)
+	three     = big.NewInt(3)
+	blocksize = big.NewInt(blocksize_int)
 )
 
 const (
-	blocksize = 100000000
+	blocksize_int = 100000000
 )
 
 // NodeInfo holds some somewhat arbitrary info about a worker node.
@@ -55,15 +57,21 @@ type WorkPacket struct {
 	Expiry time.Time `json:"expiry,omitempty"`
 }
 
+// UserCredentials hold the userid, secret, and secret version we will use
+// to authenticate.  The UserSecret is the only part that is strictly
+// confidential.  Using a UserSecretVersion allows rotation of the secret
+// if one is compromised, while maintaining some amount of trust in
+// what was already submitted.
 type UserCredentials struct {
-	UserID            string `json:"userId,omitempty"`
+	UserID            string `json:"userID,omitempty"`
+	UserSecretVersion string `json:"userSecretVersion,omitempty"`
 	UserSecret        string `json:"userSecret,omitempty"`
-	UserSecretVersion string `json:"user_secret_version,omitempty"`
 }
 
+// WorkAuthenticator is a signature on the work we performed.
 type WorkAuthenticator struct {
-	UserSecretVersion    string `json:"userSecretVersion,omitempty"`
 	AuthenticatorVersion string `json:"authenticatorVersion,omitempty"`
+	UserSecretVersion    string `json:"userSecretVersion,omitempty"`
 	Authenticator        string `json:"authenticator,omitempty"`
 }
 
@@ -78,7 +86,7 @@ type WorkEvidence struct {
 // completed work, as well as status updates as work is
 // performed, and other status changes.
 type WorkProgressReport struct {
-	Work WorkPacket
+	Work WorkPacket `json:"work,omitempty"`
 
 	// NodeInfo is the collected node info for where this work
 	// was performed.
@@ -105,22 +113,16 @@ type WorkProgressReport struct {
 	// CompletedOn is when we completed the work.
 	CompletedOn time.Time `json:"completedOn,omitempty"`
 
-	Evidence WorkEvidence `json:"evidence,omitempty"`
+	Evidence      WorkEvidence      `json:"evidence,omitempty"`
+	Authenticator WorkAuthenticator `json:"authenticator,omitempty"`
 }
-
-var (
-	work = &WorkPacket{
-		ID:         "id-of-packet",
-		Nonce:      "nonce-of-packet",
-		AssignedOn: time.Now().UTC(),
-	}
-)
 
 // envidenceHash returns a base64 encoded hash for the evidence provided.
 func evidenceHash(user UserCredentials, work WorkPacket, evidence WorkEvidence) WorkAuthenticator {
 	h := blake3.New()
-	s := fmt.Sprintf("%s:%s:%s:%s:%d:%d",
+	s := fmt.Sprintf("%s:%s:%s:%s:%s:%s:%s:%d:%d",
 		work.ID, work.Nonce, work.StartingValue, work.EndingValue,
+		user.UserID, user.UserSecretVersion, user.UserSecret,
 		evidence.TotalIterations, evidence.MaxIterations)
 	h.Write([]byte(s))
 	sum := h.Sum(nil)
@@ -153,30 +155,49 @@ func main() {
 	}
 	log.Printf("Node Info: %#v", ni)
 
-	starting := big.NewInt(0)
-	starting.SetBit(starting, 67, 1)
-	starting.SetBit(starting, 0, 1) // make odd
+	initial := big.NewInt(0)
+	initial.SetBit(initial, 40, 1)
+	initial.SetBit(initial, 0, 1) // make odd
 
-	ending := big.NewInt(0)
-	ending.Add(ending, starting)
-	count := big.NewInt(blocksize)
-	ending.Add(ending, count)
+	var wg sync.WaitGroup
 
-	work.StartingValue = starting
-	work.EndingValue = ending
-	totalInterations, max, found := run(work)
-	log.Printf("totalIterations: %d", totalInterations)
-	log.Printf("found: %v", found)
-	log.Printf("Average iterations per test: %.6f", float64(totalInterations)/float64(blocksize))
-	log.Printf("  max %d", max)
+	for workerID := 0; workerID < 4; workerID++ {
+		wg.Add(1)
+		starting := big.NewInt(0)
+		starting.Add(starting, initial)
+
+		initial.Add(initial, blocksize)
+
+		ending := big.NewInt(0)
+		ending.Add(ending, starting)
+		ending.Add(ending, blocksize)
+
+		work := &WorkPacket{
+			ID:            "id-of-packet",
+			Nonce:         "nonce-of-packet",
+			AssignedOn:    time.Now().UTC(),
+			StartingValue: starting,
+			EndingValue:   ending,
+		}
+		go func(workerID int) {
+			defer wg.Done()
+			totalInterations, max, found := run(work, workerID)
+			log.Printf("%04d: totalIterations: %d", workerID, totalInterations)
+			log.Printf("%04d: found: %v", workerID, found)
+			log.Printf("%04d: Average iterations per test: %.6f",
+				workerID, float64(totalInterations)/float64(blocksize_int))
+			log.Printf("%04d:   max %d", workerID, max)
+		}(workerID)
+	}
+	wg.Wait()
 }
 
-func run(work *WorkPacket) (uint64, uint64, []*big.Int) {
+func run(work *WorkPacket, workerID int) (uint64, uint64, []*big.Int) {
 	startTime := time.Now().UTC().UnixMilli()
 	counter := 0
 	current := big.NewInt(0)
 	current.Add(current, work.StartingValue)
-	interetingNumbers := []*big.Int{}
+	interestingNumbers := []*big.Int{}
 	totalIterations := uint64(0)
 	maxIterations := uint64(0)
 	for {
@@ -185,8 +206,8 @@ func run(work *WorkPacket) (uint64, uint64, []*big.Int) {
 			now := time.Now().UTC().UnixMilli()
 			rate := calcRate(work.StartingValue, current, startTime, now)
 
-			log.Printf("bitlen %d testing %s, totalIterations %d, rate %.5f",
-				current.BitLen(), current, totalIterations, rate)
+			log.Printf("%04d: bitlen %d testing %s, totalIterations %d, rate %.5f",
+				workerID, current.BitLen(), current, totalIterations, rate)
 			counter = 0
 		}
 		interesting, iterCount := iterate(current)
@@ -197,10 +218,10 @@ func run(work *WorkPacket) (uint64, uint64, []*big.Int) {
 		if interesting {
 			v := big.NewInt(0)
 			v.Add(v, current)
-			interetingNumbers = append(interetingNumbers, v)
+			interestingNumbers = append(interestingNumbers, v)
 		}
 		shouldEnd := current.Cmp(work.EndingValue)
-		if shouldEnd > 0 {
+		if shouldEnd >= 0 {
 			break
 		}
 		current.Add(current, two)
@@ -208,13 +229,13 @@ func run(work *WorkPacket) (uint64, uint64, []*big.Int) {
 	endTime := time.Now().UTC().UnixMilli()
 	rate := calcRate(work.StartingValue, work.EndingValue, startTime, endTime)
 
-	log.Printf("Block completed.")
-	log.Printf("   Starting: %s", work.StartingValue)
-	log.Printf("     Ending: %s", work.EndingValue)
-	log.Printf("       last: %s", current)
-	log.Printf("       Rate: %.5f", rate)
-	log.Printf("Interesting: %v", interetingNumbers)
-	return totalIterations, maxIterations, interetingNumbers
+	log.Printf("%04d: Block completed.", workerID)
+	log.Printf("%04d:    Starting: %s", workerID, work.StartingValue)
+	log.Printf("%04d:      Ending: %s", workerID, work.EndingValue)
+	log.Printf("%04d:        last: %s", workerID, current)
+	log.Printf("%04d:        Rate: %.5f", workerID, rate)
+	log.Printf("%04d: Interesting: %v", workerID, interestingNumbers)
+	return totalIterations, maxIterations, interestingNumbers
 }
 
 func calcRate(s *big.Int, c *big.Int, startTime int64, endTime int64) float64 {
