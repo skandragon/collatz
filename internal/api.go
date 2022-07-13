@@ -19,19 +19,24 @@ package internal
 import (
 	"encoding/base64"
 	"fmt"
+	"log"
 	"math/big"
 	"time"
 
-	"github.com/shirou/gopsutil/cpu"
 	"github.com/shirou/gopsutil/host"
+	"github.com/tklauser/numcpus"
 	"github.com/zeebo/blake3"
 )
 
+type cpuinfo struct {
+	Count int `json:"count,omitempty"`
+}
+
 // NodeInfo holds some somewhat arbitrary info about a worker node.
 type NodeInfo struct {
-	HostInfo host.InfoStat  `json:"hostInfo,omitempty"`
-	CPUInfo  []cpu.InfoStat `json:"cpuInfo,omitempty"`
-	Workers  int            `json:"workers,omitempty"`
+	HostInfo host.InfoStat `json:"hostInfo,omitempty"`
+	CPUInfo  cpuinfo       `json:"cpuInfo,omitempty"`
+	Workers  int           `json:"workers,omitempty"`
 }
 
 // WorkPacket is a message from the server to incidate a work
@@ -138,16 +143,17 @@ func evidenceHash(user UserCredentials, work WorkPacket, evidence WorkEvidence) 
 }
 
 // CPUInfo returns the data about this specific node, to be used in reports as-is.
-func CPUInfo(workers int) (*NodeInfo, error) {
-	cpus, err := cpu.Info()
+func CPUInfo() (*NodeInfo, error) {
+	online, err := numcpus.GetOnline()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("numcpus.GetOnline(): %v", err)
 	}
+	log.Printf("Found %d online CPUs", online)
 
 	hostInfo, err := host.Info()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("host.Info(): %v", err)
 	}
 
-	return &NodeInfo{HostInfo: *hostInfo, CPUInfo: cpus, Workers: workers}, nil
+	return &NodeInfo{HostInfo: *hostInfo, CPUInfo: cpuinfo{Count: online}, Workers: -1}, nil
 }

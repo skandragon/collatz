@@ -34,14 +34,15 @@ var (
 
 const (
 	blocksizeInt = 100000000
-	workers      = 4
 )
 
 func main() {
-	ni, err := internal.CPUInfo(workers)
+	ni, err := internal.CPUInfo()
 	if err != nil {
 		log.Fatalf("cannot get node or cpu info: %v", err)
 	}
+	workers := ni.CPUInfo.Count
+	ni.Workers = workers
 	log.Printf("Node Info: %#v", ni)
 
 	initial := big.NewInt(0)
